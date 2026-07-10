@@ -17,6 +17,7 @@ param(
     [ValidateSet("yes", "no")]$TPMBypass = "",
     [ValidateSet("yes", "no")]$UserFoldersEnable = "",
     [ValidateSet("yes", "no")]$DriverIntegrate = "",
+    [ValidateSet("yes", "no")]$UpdateIntegrate = "",
     [ValidateSet("yes", "no")]$ESDConvert = "",
     [ValidateSet("yes", "no")]$useOscdimg = ""
 )
@@ -381,6 +382,188 @@ function Get-ImageIndex {
     }
 }
 
+# Function to automatically search and download both Servicing Stack Update (SSU) and Cumulative Update (LCU)
+function Get-LatestWindowsUpdates {
+    param (
+        [Parameter(Mandatory = $true)][string]$ProductName,
+        [Parameter(Mandatory = $false)][string]$DisplayVersion,
+        [Parameter(Mandatory = $true)][string]$Architecture,
+        [Parameter(Mandatory = $true)][string]$DownloadDir
+    )
+
+    $result = [PSCustomObject]@{
+        SsuPath = $null
+        LcuPath = $null
+        NetPath1 = $null
+        NetPath2 = $null
+    }
+
+    try {
+        # Check internet connection
+        Test-InternetConnection -maxAttempts 2 -retryDelay 2 | Out-Null
+
+        # Determine OS (Windows 10 / Windows 11)
+        $osName = ""
+        if ($ProductName -match "Windows 11") {
+            $osName = "Windows 11"
+        } elseif ($ProductName -match "Windows 10") {
+            $osName = "Windows 10"
+        } else {
+            Write-Host "Unsupported OS for automatic updates: $ProductName" -ForegroundColor Yellow
+            return $result
+        }
+
+        # Helper internal scriptblock to search and download a single package type
+        $DownloadPackage = {
+            param ($queryStr, $filterStr, $urlFilterStr = "")
+            
+            Write-Host "Searching Microsoft Update Catalog for: `"$queryStr`"..." -ForegroundColor Cyan
+            Write-Log -msg "Searching Update Catalog for: $queryStr"
+
+            $encodedQuery = [uri]::EscapeDataString($queryStr)
+            $searchUri = "https://www.catalog.update.microsoft.com/Search.aspx?q=$encodedQuery"
+            try {
+                $response = Invoke-WebRequest -Uri $searchUri -UseBasicParsing -ErrorAction Stop
+                $html = $response.Content
+            } catch {
+                Write-Host "Failed to search Catalog for query: $queryStr" -ForegroundColor Red
+                return $null
+            }
+
+            $selectedUpdateId = $null
+            $selectedUpdateTitle = ""
+            $isNetQuery = $queryStr -match "\.NET"
+
+            $catalogMatches = [regex]::Matches($html, 'goToDetails\(\s*\"([a-fA-F0-9\-]+)\"\s*\)')
+            if ($catalogMatches.Count -eq 0) {
+                return $null
+            }
+
+            # Adjust filter for ARM64 or x86/x64 matching
+            $excludeArchFilter = if ($Architecture -eq "x64") { "ARM64" } elseif ($Architecture -eq "ARM64") { "x64" } else { "" }
+
+            foreach ($m in $catalogMatches) {
+                $id = $m.Groups[1].Value
+                $pattern = "onclick='goToDetails\(`"$id`"\);'[^>]*>\s*(.*?)\s*<\/a>"
+                $titleMatch = [regex]::Match($html, $pattern)
+                if ($titleMatch.Success) {
+                    $title = $titleMatch.Groups[1].Value.Trim()
+                    # Filter matching and excludes
+                    if ($title -match $filterStr -and 
+                        $title -notmatch "Preview" -and 
+                        $title -notmatch "Dynamic" -and 
+                        $title -notmatch "Server" -and 
+                        ($excludeArchFilter -eq "" -or $title -notmatch $excludeArchFilter) -and 
+                        ($isNetQuery -or $title -notmatch "\.NET")) {
+                        
+                        $selectedUpdateId = $id
+                        $selectedUpdateTitle = $title
+                        break
+                    }
+                }
+            }
+
+            if (-not $selectedUpdateId) {
+                return $null
+            }
+
+            Write-Host "Found: $selectedUpdateTitle" -ForegroundColor Green
+            Write-Log -msg "Selected Update: $selectedUpdateTitle (ID: $selectedUpdateId)"
+
+            $dialogUrl = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx"
+            $body = @{ updateIDs = "[{`"updateID`": `"$selectedUpdateId`"}]" }
+            try {
+                $dialogResponse = Invoke-WebRequest -Uri $dialogUrl -Method Post -Body $body -UseBasicParsing -ErrorAction Stop
+                $dialogHtml = $dialogResponse.Content
+            } catch {
+                Write-Host "Failed to get download dialog for update ID: $selectedUpdateId" -ForegroundColor Red
+                return $null
+            }
+
+            $archPattern = if ($Architecture -eq "x64") { "x64" } else { $Architecture }
+            $archEscaped = [regex]::Escape($archPattern)
+
+            # Collect ALL .msu URLs from dialog
+            $allUrlMatches = [regex]::Matches($dialogHtml, '(https?://[a-zA-Z0-9\-\.\/]+download\.windowsupdate\.com/[a-zA-Z0-9\-\.\/_\~]*\.msu)')
+            $downloadUrl = $null
+            foreach ($u in $allUrlMatches) {
+                $candidate = $u.Groups[1].Value
+                # Must match architecture
+                if ($candidate -notmatch "-${archEscaped}[_\-\.]" -and $candidate -notmatch "/${archEscaped}[_\-\.]") { continue }
+                # Apply optional URL filter (e.g. ndp48 vs ndp481)
+                if ($urlFilterStr -and $candidate -notmatch [regex]::Escape($urlFilterStr)) { continue }
+                $downloadUrl = $candidate
+                break
+            }
+            # Fallback: pick first URL without arch/url filtering
+            if (-not $downloadUrl -and $allUrlMatches.Count -gt 0) {
+                $downloadUrl = $allUrlMatches[0].Groups[1].Value
+            }
+            if (-not $downloadUrl) {
+                return $null
+            }
+
+            # $downloadUrl already set above
+            $fileName = [System.IO.Path]::GetFileName($downloadUrl)
+            $destinationFile = Join-Path $DownloadDir $fileName
+
+            Write-Host "Downloading: $fileName..." -ForegroundColor Cyan
+            Write-Log -msg "Downloading from $downloadUrl to $destinationFile"
+
+            if (-not (Test-Path $DownloadDir)) {
+                New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null
+            }
+
+            $ProgressPreference = 'SilentlyContinue'
+            try {
+                Start-BitsTransfer -Source $downloadUrl -Destination $destinationFile -ErrorAction Stop
+            } catch {
+                try {
+                    Invoke-WebRequest -Uri $downloadUrl -OutFile $destinationFile -UseBasicParsing -ErrorAction Stop
+                } catch {
+                    Write-Host "Download failed for: $fileName" -ForegroundColor Red
+                    return $null
+                }
+            } finally {
+                $ProgressPreference = 'Continue'
+            }
+
+            if (Test-Path $destinationFile) {
+                Write-Host "Download completed successfully." -ForegroundColor Green
+                return $destinationFile
+            }
+            return $null
+        }
+
+        # 1. Search and download Servicing Stack Update (SSU)
+        $ssuQuery = "$osName"
+        if ($DisplayVersion) { $ssuQuery += " Version $DisplayVersion" }
+        $ssuQuery += " $Architecture Servicing Stack Update"
+        $result.SsuPath = & $DownloadPackage -queryStr $ssuQuery -filterStr "Servicing Stack Update"
+
+        # 2. Search and download Cumulative Update (LCU)
+        $lcuQuery = "$osName"
+        if ($DisplayVersion) { $lcuQuery += " Version $DisplayVersion" }
+        $lcuQuery += " $Architecture Cumulative"
+        $result.LcuPath = & $DownloadPackage -queryStr $lcuQuery -filterStr "Cumulative Update"
+
+        # 3. Search and download .NET Framework Cumulative Update for 3.5 and 4.8
+        $netQuery = "$osName"
+        if ($DisplayVersion) { $netQuery += " Version $DisplayVersion" }
+        $netQuery += " $Architecture .NET Framework"
+        $result.NetPath1 = & $DownloadPackage -queryStr $netQuery -filterStr "Cumulative Update for \.NET Framework 3\.5 and 4\.8" -urlFilterStr "ndp48_"
+
+        # 4. Search and download .NET Framework Cumulative Update for 3.5, 4.8 and 4.8.1
+        $result.NetPath2 = & $DownloadPackage -queryStr $netQuery -filterStr "Cumulative Update for \.NET Framework 3\.5, 4\.8 and 4\.8\.1" -urlFilterStr "ndp481"
+
+        return $result
+    } catch {
+        Write-Host "Error in Get-LatestWindowsUpdates: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Log -msg "Error in Get-LatestWindowsUpdates: $($_.Exception.Message)"
+        return $result
+    }
+}
+
 # Oscdimg Path
 $OscdimgPath = "$env:SystemDrive\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg"
 $Oscdimg = Join-Path -Path $OscdimgPath -ChildPath 'oscdimg.exe'
@@ -589,11 +772,12 @@ Write-Host
 $DoAppxRemove = Get-ParameterValue -ParameterValue $AppxRemove -DefaultValue $true -Question "Remove unnecessary packages?" -Description "Recommended: Removes bloatware apps"
 $DoCapabilitiesRemove = Get-ParameterValue -ParameterValue $CapabilitiesRemove -DefaultValue $true -Question "Remove unnecessary features?" -Description "Recommended: Removes optional Windows features"
 $DoOnedriveRemove = Get-ParameterValue -ParameterValue $OnedriveRemove -DefaultValue $true -Question "Remove OneDrive?" -Description "Optional: Completely removes OneDrive"
-$DoEDGERemove = Get-ParameterValue -ParameterValue $EDGERemove -DefaultValue $true -Question "Remove Microsoft Edge?" -Description "Optional: Removes Edge components (Breaks Widgets)"
+$DoEDGERemove = Get-ParameterValue -ParameterValue $EDGERemove -DefaultValue $false -Question "Remove Microsoft Edge?" -Description "Optional: Removes Edge components (Breaks Widgets)"
 $DoAIRemove = Get-ParameterValue -ParameterValue $AIRemove -DefaultValue $true -Question "Remove AI Components?" -Description "Optional: Removes everything related to AI"
 $DoTPMBypass = Get-ParameterValue -ParameterValue $TPMBypass -DefaultValue $false -Question "Bypass TPM check?" -Description "Only if needed for older hardware"
 $DoUserFoldersEnable = Get-ParameterValue -ParameterValue $UserFoldersEnable -DefaultValue $true -Question "Enable user folders?" -Description "Recommended: Enables Desktop, Documents, etc."
 $DoDriverIntegrate = Get-ParameterValue -ParameterValue $DriverIntegrate -DefaultValue $false -Question "Integrate Intel RST/VMD drivers?" -Description "Optional: Helps with Intel VMD storage controllers"
+$DoUpdateIntegrate = Get-ParameterValue -ParameterValue $UpdateIntegrate -DefaultValue $true -Question "Integrate the latest Windows Updates?" -Description "Optional: Automatically downloads and integrates latest Cumulative Update"
 $DoESDConvert = Get-ParameterValue -ParameterValue $ESDConvert -DefaultValue $false -Question "Compress the ISO?" -Description "Recommended but slow: Reduces ISO file size"
 $DoUseOscdimg = Get-ParameterValue -ParameterValue $useOscdimg -DefaultValue $true -Question "Use Oscdimg for ISO creation?" -Description "Recommended: Oscdimg is more reliable"
 
@@ -743,6 +927,163 @@ function Remove-Packages {
 $allPatterns = $appxPatternsToRemove + $capabilitiesToRemove + $windowsPackagesToRemove
 $maxLength = ($allPatterns | ForEach-Object { $_.TrimEnd('*').Length } | Measure-Object -Maximum).Maximum
 $statusColumn = $maxLength + 18
+
+# Integrate Windows Updates
+# This runs immediately after mounting the image, BEFORE any package/feature/app
+# removal below. DISM must patch the Cumulative Update while all original
+# components are still intact - removing bloat first and patching afterward can
+# leave the CU only partially applied (parts of its payload target files that
+# debloat already deleted), which causes Windows Update to keep re-offering and
+# re-installing the same KB indefinitely after real deployment. This mirrors the
+# recommended order used by other slipstreaming tools (e.g. MSMG Toolkit:
+# Integrate updates first, Remove bloat second).
+if ($DoUpdateIntegrate) {
+    Write-Host ("`n[INFO] Reading OS info for Windows Update integration...") -ForegroundColor Cyan
+    Write-Log -msg "Loading registry to read OS info for update integration"
+    reg load HKLM\zSOFTWARE "$installMountDir\Windows\System32\config\SOFTWARE" 2>&1 | Write-Log
+    reg load HKLM\zSYSTEM "$installMountDir\Windows\System32\config\SYSTEM" 2>&1 | Write-Log
+
+    $osProductName = ""
+    $osDisplayVersion = ""
+    $osArchitecture = "x64" # Default fallback
+    try {
+        $osProductName = (Get-ItemProperty -Path 'Registry::HKLM\zSOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName -ErrorAction SilentlyContinue).ProductName
+        $osDisplayVersion = (Get-ItemProperty -Path 'Registry::HKLM\zSOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name DisplayVersion -ErrorAction SilentlyContinue).DisplayVersion
+
+        # Read architecture from environment registry of the mounted image
+        $arch = (Get-ItemProperty -Path 'Registry::HKLM\zSYSTEM\ControlSet001\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue).PROCESSOR_ARCHITECTURE
+        if ($arch -ieq "AMD64") {
+            $osArchitecture = "x64"
+        } elseif ($arch -ieq "x86") {
+            $osArchitecture = "x86"
+        } elseif ($arch -ieq "ARM64") {
+            $osArchitecture = "ARM64"
+        }
+    } catch {}
+
+    reg unload HKLM\zSOFTWARE 2>&1 | Write-Log
+    reg unload HKLM\zSYSTEM 2>&1 | Write-Log
+
+    Write-Host ("`n[INFO] Integrating Latest Windows Updates...") -ForegroundColor Cyan
+    Write-Host ("  This may take some time") -ForegroundColor DarkGray
+    Write-Log -msg "Starting Windows update integration"
+
+    $updatesTempPath = "$env:SystemDrive\WIDTemp\updates"
+    try {
+        $updates = Get-LatestWindowsUpdates -ProductName $osProductName -DisplayVersion $osDisplayVersion -Architecture $osArchitecture -DownloadDir $updatesTempPath
+        $ssuFile = $updates.SsuPath
+        $lcuFile = $updates.LcuPath
+        
+        # 1. Integrate SSU first if found
+        # Note: direct .msu integration is used (not manual cab/manifest
+        # extraction). Testing showed that manually extracting multi-package
+        # .msu files and dumping them into one folder can silently produce an
+        # incomplete package - DISM reports success offline, but Windows keeps
+        # re-detecting/re-installing the same update after real deployment.
+        # DISM's native .msu handling correctly resolves all bundled
+        # sub-packages, so it is safer even though offline finalization for
+        # very recent Cumulative Updates is a separate, known Microsoft-side
+        # limitation (see notes below on the LCU block).
+        if ($ssuFile -and (Test-Path $ssuFile)) {
+            Write-Host "  - Integrating Servicing Stack Update (SSU)..." -ForegroundColor DarkGray
+            Write-Log -msg "Integrating SSU: $ssuFile"
+            # Run DISM directly to show progress bar in console
+            dism.exe /Image:$installMountDir /Add-Package /PackagePath:$ssuFile
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "DISM SSU integration returned exit code $LASTEXITCODE. Retrying with PowerShell..."
+                Add-WindowsPackage -Path $installMountDir -PackagePath $ssuFile -ErrorAction Stop
+            }
+            Write-Log -msg "SSU integration completed successfully"
+        } else {
+            throw "Servicing Stack Update (SSU) was not found or failed to download. Cannot proceed safely."
+        }
+
+        # 2. Integrate LCU next if found
+        # Note: as of ~Nov 2025, Microsoft changed how recent Cumulative Updates
+        # are packaged - they are only designed to fully finalize during "live"
+        # online servicing (i.e. after Windows actually boots and Windows Update
+        # itself processes them), not via offline DISM slipstreaming into a WIM.
+        # No DISM invocation method (direct .msu or manual extraction) can force
+        # full offline finalization for these. This means the freshly-deployed
+        # OS may show/re-apply this same KB once via Windows Update after first
+        # boot - that one-time catch-up is expected and not a script bug.
+        if ($lcuFile -and (Test-Path $lcuFile)) {
+            Write-Host "  - Integrating Cumulative Update (LCU) (This will take 10-30 mins, please wait)..." -ForegroundColor DarkGray
+            Write-Log -msg "Integrating LCU: $lcuFile"
+            # Run DISM directly to show progress bar in console
+            dism.exe /Image:$installMountDir /Add-Package /PackagePath:$lcuFile
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "DISM LCU integration returned exit code $LASTEXITCODE. Retrying with PowerShell..."
+                Add-WindowsPackage -Path $installMountDir -PackagePath $lcuFile -ErrorAction Stop
+            }
+            Write-Host ("[OK] Windows Update LCU integration completed") -ForegroundColor Green
+            Write-Log -msg "LCU integration completed successfully"
+        } else {
+            throw "Cumulative Update (LCU) was not found or failed to download. Cannot proceed safely."
+        }
+
+        # 3. Integrate .NET Framework 3.5 & 4.8 update if found
+        # Note: .NET Framework packages never exhibited the "Install Pending" issue
+        # that affects the main LCU, so they're integrated directly from the .msu
+        # (same as the original method) - DISM's native .msu handling correctly
+        # resolves the multiple sub-packages bundled inside these .NET update files,
+        # which manual cab/manifest extraction was breaking.
+        $netFile1 = $updates.NetPath1
+        if ($netFile1 -and (Test-Path $netFile1)) {
+            Write-Host "  - Integrating .NET Framework 3.5 and 4.8 Cumulative Update..." -ForegroundColor DarkGray
+            Write-Log -msg "Integrating .NET 3.5/4.8 update: $netFile1"
+            dism.exe /Image:$installMountDir /Add-Package /PackagePath:$netFile1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "DISM .NET 3.5/4.8 integration returned exit code $LASTEXITCODE. Retrying with PowerShell..."
+                Add-WindowsPackage -Path $installMountDir -PackagePath $netFile1 -ErrorAction Stop
+            }
+            Write-Host ("[OK] .NET Framework 3.5 and 4.8 update integration completed") -ForegroundColor Green
+            Write-Log -msg ".NET Framework 3.5 and 4.8 update integration completed successfully"
+        } else {
+            Write-Warning "Cumulative Update for .NET Framework 3.5 and 4.8 was not found. Skipping."
+        }
+
+        # 4. Integrate .NET Framework 3.5, 4.8 & 4.8.1 update if found
+        # Note: this package only applies to images that already have .NET Framework
+        # 4.8.1 present, which a stock Windows 10 image doesn't. Microsoft has also
+        # acknowledged this specific update can fail when applied via DISM to an
+        # offline image (see: .NET Framework April 2026 cumulative update release
+        # notes) - a fix from Microsoft is still pending, so this is treated as
+        # non-fatal and skipped rather than aborting the whole ISO build.
+        $netFile2 = $updates.NetPath2
+        if ($netFile2 -and (Test-Path $netFile2)) {
+            Write-Host "  - Integrating .NET Framework 3.5, 4.8 and 4.8.1 Cumulative Update..." -ForegroundColor DarkGray
+            Write-Log -msg "Integrating .NET 3.5/4.8/4.8.1 update: $netFile2"
+            try {
+                dism.exe /Image:$installMountDir /Add-Package /PackagePath:$netFile2
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "DISM .NET 3.5/4.8/4.8.1 integration returned exit code $LASTEXITCODE. Retrying with PowerShell..."
+                    Add-WindowsPackage -Path $installMountDir -PackagePath $netFile2 -ErrorAction Stop
+                }
+                Write-Host ("[OK] .NET Framework 3.5, 4.8 and 4.8.1 update integration completed") -ForegroundColor Green
+                Write-Log -msg ".NET Framework 3.5, 4.8 and 4.8.1 update integration completed successfully"
+            } catch {
+                Write-Warning "Cumulative Update for .NET Framework 3.5, 4.8 and 4.8.1 was not applicable to this image (expected if .NET 4.8.1 isn't present, or a known Microsoft offline-DISM applicability issue). Skipping: $_"
+                Write-Log -msg ".NET 3.5/4.8/4.8.1 update integration skipped (not applicable): $_"
+            }
+        } else {
+            Write-Warning "Cumulative Update for .NET Framework 3.5, 4.8 and 4.8.1 was not found. Skipping."
+        }
+    } catch {
+        Write-Host "`n[ERROR] Windows Update integration failed: $_" -ForegroundColor Red
+        Write-Log -msg "Windows Update integration failed: $_"
+        
+        $confirm = Read-Host -Prompt "Do you want to continue building the ISO WITHOUT updates? (y/N)"
+        if ($confirm -notmatch "^y(es)?$") {
+            Remove-Item -Path $updatesTempPath -Recurse -Force -ErrorAction SilentlyContinue 2>&1 | Write-Log
+            Remove-TempFiles
+            Pause
+            Exit
+        }
+    } finally {
+        Remove-Item -Path $updatesTempPath -Recurse -Force -ErrorAction SilentlyContinue 2>&1 | Write-Log
+    }
+}
 
 # Remove AppX Packages
 if ($DoAppxRemove) {
@@ -1414,6 +1755,7 @@ reg unload HKLM\zSOFTWARE 2>&1 | Write-Log
 reg unload HKLM\zSYSTEM 2>&1 | Write-Log
 Write-Host ("[OK] Success") -ForegroundColor Green
 
+
 # Integrate Intel RST/VMD Drivers
 if ($DoDriverIntegrate) {
     Write-Host ("`n[INFO] Integrating Intel RST/VMD Drivers...") -ForegroundColor Cyan
@@ -1512,7 +1854,58 @@ else {
 # Unmounting and cleaning up the image
 Write-Host ("`n[INFO] Cleaning up image...") -ForegroundColor Cyan
 Write-Log -msg "Cleaning up image"
-Invoke-DismFailsafe {Repair-WindowsImage -Path $installMountDir -StartComponentCleanup -ResetBase} {dism /image:$installMountDir /Cleanup-Image /StartComponentCleanup /ResetBase}
+
+# MSMG Toolkit Style manual file cleanup
+Write-Host "  - Cleaning up temporary and log files/folders..." -ForegroundColor DarkGray
+Write-Log -msg "Performing manual temporary and log file cleanup inside mounted WIM"
+
+# Delete registry transaction logs & temp files
+$cleanupPaths = @(
+    "$installMountDir\Users\Default\*.LOG1",
+    "$installMountDir\Users\Default\*.LOG2",
+    "$installMountDir\Users\Default\*.TM.blf",
+    "$installMountDir\Users\Default\*.regtrans-ms",
+    "$installMountDir\Windows\inf\*.log",
+    "$installMountDir\Windows\System32\config\*.LOG1",
+    "$installMountDir\Windows\System32\config\*.LOG2",
+    "$installMountDir\Windows\System32\config\*.TM.blf",
+    "$installMountDir\Windows\System32\config\*.regtrans-ms",
+    "$installMountDir\Windows\System32\SMI\Store\Machine\*.LOG1",
+    "$installMountDir\Windows\System32\SMI\Store\Machine\*.LOG2",
+    "$installMountDir\Windows\System32\SMI\Store\Machine\*.TM.blf",
+    "$installMountDir\Windows\System32\SMI\Store\Machine\*.regtrans-ms",
+    "$installMountDir\Windows\WinSxS\Backup\*",
+    "$installMountDir\Windows\WinSxS\ManifestCache\*.bin",
+    "$installMountDir\Windows\WinSxS\Temp\PendingDeletes\*",
+    "$installMountDir\Windows\WinSxS\Temp\TransformerRollbackData\*"
+)
+
+foreach ($path in $cleanupPaths) {
+    if (Test-Path $path) {
+        Remove-Item -Path $path -Force -Recurse -ErrorAction SilentlyContinue
+    }
+}
+
+# Clean CbsTemp directory
+if (Test-Path "$installMountDir\Windows\CbsTemp") {
+    Remove-Item -Path "$installMountDir\Windows\CbsTemp\*" -Force -Recurse -ErrorAction SilentlyContinue
+}
+
+# Clean Recycler and PerfLogs
+if (Test-Path "$installMountDir\`$Recycle.Bin") {
+    Remove-Item -Path "$installMountDir\`$Recycle.Bin" -Force -Recurse -ErrorAction SilentlyContinue
+}
+if (Test-Path "$installMountDir\PerfLogs") {
+    Remove-Item -Path "$installMountDir\PerfLogs" -Force -Recurse -ErrorAction SilentlyContinue
+}
+
+# Run DISM component cleanup if safe (no pending.xml)
+if (Test-Path "$installMountDir\Windows\WinSxS\pending.xml") {
+    Write-Host "  - pending.xml found. Skipping DISM Component Cleanup to prevent update corruption." -ForegroundColor Yellow
+    Write-Log -msg "Skipping DISM component cleanup because pending.xml is present"
+} else {
+    dism.exe /Image:$installMountDir /Cleanup-Image /StartComponentCleanup /ResetBase
+}
 
 Write-Host ("`n[INFO] Unmounting and Exporting image...") -ForegroundColor Cyan
 Write-Log -msg "Unmounting image"
