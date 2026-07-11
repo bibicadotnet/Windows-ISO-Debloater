@@ -625,6 +625,11 @@ $sourceDrive = "${sourceDriveLetter}:\"                             # Source Dri
 $destinationPath = "$env:SystemDrive\WIDTemp\winlite"               # Destination Path
 $installMountDir = "$env:SystemDrive\WIDTemp\mountdir\installWIM"   # Mount Directory
 
+# Clean up any stale mount points from previous runs
+Write-Host "`nCleaning up stale mount points..." -ForegroundColor Yellow
+dism /unmount-image /mountdir:$installMountDir /discard 2>&1 | Out-Null
+dism /Cleanup-Mountpoints 2>&1 | Out-Null
+
 # Copy Files
 Write-Host "`nCopying files from " -NoNewline; Write-Host "`"$sourceDrive`"" -ForegroundColor Yellow -NoNewline; Write-Host " to " -NoNewline; Write-Host "`"$destinationPath`"" -ForegroundColor Yellow; Write-Log -msg "Copying files from $sourceDrive to $destinationPath"
 try {
