@@ -658,6 +658,7 @@ $installEsdPath = Join-Path $destinationPath "sources\install.esd"
 New-Item -ItemType Directory -Path $installMountDir 2>&1 | Write-Log
 
 # Handling install.wim and install.esd
+$globalSelectedImageName = ""
 if (-not (Test-Path $installWimPath)) {
     Write-Host "`ninstall.wim not found. Searching for install.esd..."
     if (Test-Path $installEsdPath) {
@@ -680,15 +681,26 @@ if (-not (Test-Path $installWimPath)) {
             # If winEdition is specified, find the index; else prompt user
             if ($winEdition) {
                 $matchedImage = $esdInfo | Where-Object { $_.ImageName -ieq $winEdition }
+                if (-not $matchedImage) {
+                    $matchedImage = $esdInfo | Where-Object { $_.ImageName -like "*$winEdition*" } | Select-Object -First 1
+                }
                 if ($matchedImage) { $sourceIndex = $matchedImage.Index }
                 else { $sourceIndex = 1 }
             }
-            else { $sourceIndex = Read-Host -Prompt "`nEnter the index to convert and mount" }
+            else {
+                if ($esdInfo.Count -eq 1) {
+                    $sourceIndex = $esdInfo[0].Index
+                    Write-Host "Only one image index found. Automatically selecting index $sourceIndex: $($esdInfo[0].ImageName)" -ForegroundColor Yellow
+                } else {
+                    $sourceIndex = Read-Host -Prompt "`nEnter the index to convert and mount"
+                }
+            }
             # Check if the index is valid, print selected "ImageIndex - ImageName"
             $selectedImage = $esdInfo | Where-Object { $_.Index -eq [int]$sourceIndex }
             if ($selectedImage) {
                 Write-Host "`nMounting image: " -NoNewline -ForegroundColor Cyan; Write-Host "$sourceIndex. $($selectedImage.ImageName)"
                 Write-Log -msg "Converting and Mounting image: $sourceIndex. $($selectedImage.ImageName)"
+                $globalSelectedImageName = $selectedImage.ImageName
             }
 
             # Convert ESD to WIM
@@ -732,15 +744,26 @@ else {
         # If winEdition is specified, find the index; else prompt user
         if ($winEdition) {
             $matchedImage = $wimInfo | Where-Object { $_.ImageName -ieq $winEdition }
+            if (-not $matchedImage) {
+                $matchedImage = $wimInfo | Where-Object { $_.ImageName -like "*$winEdition*" } | Select-Object -First 1
+            }
             if ($matchedImage) { $sourceIndex = $matchedImage.Index }
             else { $sourceIndex = 1 }
         }
-        else { $sourceIndex = Read-Host -Prompt "`nEnter the index to mount" }
+        else {
+            if ($wimInfo.Count -eq 1) {
+                $sourceIndex = $wimInfo[0].Index
+                Write-Host "Only one image index found. Automatically selecting index $sourceIndex: $($wimInfo[0].ImageName)" -ForegroundColor Yellow
+            } else {
+                $sourceIndex = Read-Host -Prompt "`nEnter the index to mount"
+            }
+        }
         # Check if the index is valid, print selected "ImageIndex - ImageName"
         $selectedImage = $wimInfo | Where-Object { $_.Index -eq [int]$sourceIndex }
         if ($selectedImage) {
             Write-Host "`nMounting image: " -NoNewline -ForegroundColor Cyan; Write-Host "$sourceIndex. $($selectedImage.ImageName)"
             Write-Log -msg "Mounting image: $sourceIndex. $($selectedImage.ImageName)"
+            $globalSelectedImageName = $selectedImage.ImageName
         }
 
         Invoke-DismFailsafe {Mount-WindowsImage -ImagePath $installWimPath -Index $sourceIndex -Path $installMountDir} {dism /mount-image /imagefile:$installWimPath /index:$sourceIndex /mountdir:$installMountDir}
@@ -772,6 +795,42 @@ if (-not $WimDetails -or -not $WimDetails.BuildNumber -or -not $WimDetails.Langu
 }
 $langCode = $WimDetails.Language; Write-Log -msg "Detected Language: $langCode"
 $buildNumber = $WimDetails.BuildNumber; Write-Log -msg "Detected Build Number: $buildNumber"
+
+# Read OS info from mounted registry
+Write-Host ("`n[INFO] Reading OS details from mounted image...") -ForegroundColor Cyan
+Write-Log -msg "Loading registry to read OS details"
+reg load HKLM\zSOFTWARE "$installMountDir\Windows\System32\config\SOFTWARE" 2>&1 | Write-Log
+reg load HKLM\zSYSTEM "$installMountDir\Windows\System32\config\SYSTEM" 2>&1 | Write-Log
+
+$osProductName = ""
+$osDisplayVersion = ""
+$osArchitecture = "x64" # Default fallback
+try {
+    $osProductName = (Get-ItemProperty -Path 'Registry::HKLM\zSOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName -ErrorAction SilentlyContinue).ProductName
+    $osDisplayVersion = (Get-ItemProperty -Path 'Registry::HKLM\zSOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name DisplayVersion -ErrorAction SilentlyContinue).DisplayVersion
+    if (-not $osDisplayVersion) {
+        $osDisplayVersion = (Get-ItemProperty -Path 'Registry::HKLM\zSOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ReleaseId -ErrorAction SilentlyContinue).ReleaseId
+    }
+
+    # Read architecture from environment registry of the mounted image
+    $arch = (Get-ItemProperty -Path 'Registry::HKLM\zSYSTEM\ControlSet001\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue).PROCESSOR_ARCHITECTURE
+    if ($arch -ieq "AMD64") {
+        $osArchitecture = "x64"
+    } elseif ($arch -ieq "x86") {
+        $osArchitecture = "x86"
+    } elseif ($arch -ieq "ARM64") {
+        $osArchitecture = "ARM64"
+    }
+} catch {
+    Write-Log -msg "Error reading OS info from registry: $_"
+}
+
+reg unload HKLM\zSOFTWARE 2>&1 | Write-Log
+reg unload HKLM\zSYSTEM 2>&1 | Write-Log
+
+Write-Log -msg "Detected OS Product: $osProductName"
+Write-Log -msg "Detected OS Display Version: $osDisplayVersion"
+Write-Log -msg "Detected OS Architecture: $osArchitecture"
 
 Write-Host
 $DoAppxRemove = Get-ParameterValue -ParameterValue $AppxRemove -DefaultValue $true -Question "Remove unnecessary packages?" -Description "Recommended: Removes bloatware apps"
@@ -943,32 +1002,6 @@ $statusColumn = $maxLength + 18
 # recommended order used by other slipstreaming tools (e.g. MSMG Toolkit:
 # Integrate updates first, Remove bloat second).
 if ($DoUpdateIntegrate) {
-    Write-Host ("`n[INFO] Reading OS info for Windows Update integration...") -ForegroundColor Cyan
-    Write-Log -msg "Loading registry to read OS info for update integration"
-    reg load HKLM\zSOFTWARE "$installMountDir\Windows\System32\config\SOFTWARE" 2>&1 | Write-Log
-    reg load HKLM\zSYSTEM "$installMountDir\Windows\System32\config\SYSTEM" 2>&1 | Write-Log
-
-    $osProductName = ""
-    $osDisplayVersion = ""
-    $osArchitecture = "x64" # Default fallback
-    try {
-        $osProductName = (Get-ItemProperty -Path 'Registry::HKLM\zSOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName -ErrorAction SilentlyContinue).ProductName
-        $osDisplayVersion = (Get-ItemProperty -Path 'Registry::HKLM\zSOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name DisplayVersion -ErrorAction SilentlyContinue).DisplayVersion
-
-        # Read architecture from environment registry of the mounted image
-        $arch = (Get-ItemProperty -Path 'Registry::HKLM\zSYSTEM\ControlSet001\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE -ErrorAction SilentlyContinue).PROCESSOR_ARCHITECTURE
-        if ($arch -ieq "AMD64") {
-            $osArchitecture = "x64"
-        } elseif ($arch -ieq "x86") {
-            $osArchitecture = "x86"
-        } elseif ($arch -ieq "ARM64") {
-            $osArchitecture = "ARM64"
-        }
-    } catch {}
-
-    reg unload HKLM\zSOFTWARE 2>&1 | Write-Log
-    reg unload HKLM\zSYSTEM 2>&1 | Write-Log
-
     Write-Host ("`n[INFO] Integrating Latest Windows Updates...") -ForegroundColor Cyan
     Write-Host ("  This may take some time") -ForegroundColor DarkGray
     Write-Log -msg "Starting Windows update integration"
@@ -2009,12 +2042,29 @@ try {
 }
 
 Write-Log -msg "Checking required files"
+$defaultISOName = "Windows_Custom"
+if ($globalSelectedImageName) {
+    $defaultISOName = ($globalSelectedImageName -replace '[<>:"/\\|?*\x00-\x1F\s]', '_')
+}
+if ($osDisplayVersion) {
+    $defaultISOName += "_$osDisplayVersion"
+}
+if ($osArchitecture) {
+    $defaultISOName += "_$osArchitecture"
+}
+$defaultISOName += "_Debloated"
+# Clean up any consecutive underscores or trailing underscores
+$defaultISOName = ($defaultISOName -replace '_+', '_').Trim('_')
+
 if ($outputISO) {
-    $ISOFileName = ($ISOFileName -replace '[<>:"/\\|?*\x00-\x1F\s]', '').Trim()
     $ISOFileName = [System.IO.Path]::GetFileNameWithoutExtension($outputISO)
+    $ISOFileName = ($ISOFileName -replace '[<>:"/\\|?*\x00-\x1F\s]', '').Trim()
 } else {
     do {
-        $ISOFileName = Read-Host -Prompt "`nEnter the name for the ISO file (without extension)"
+        $ISOFileName = Read-Host -Prompt "`nEnter the name for the ISO file (without extension) [Default: $defaultISOName]"
+        if ([string]::IsNullOrWhiteSpace($ISOFileName)) {
+            $ISOFileName = $defaultISOName
+        }
 
         # Remove invalid characters
         $ISOFileName = ($ISOFileName -replace '[<>:"/\\|?*\x00-\x1F\s]', '').Trim()
