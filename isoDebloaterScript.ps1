@@ -690,7 +690,7 @@ if (-not (Test-Path $installWimPath)) {
             else {
                 if ($esdInfo.Count -eq 1) {
                     $sourceIndex = $esdInfo[0].Index
-                    Write-Host "Only one image index found. Automatically selecting index $sourceIndex: $($esdInfo[0].ImageName)" -ForegroundColor Yellow
+                    Write-Host "Only one image index found. Automatically selecting index ${sourceIndex}: $($esdInfo[0].ImageName)" -ForegroundColor Yellow
                 } else {
                     $sourceIndex = Read-Host -Prompt "`nEnter the index to convert and mount"
                 }
@@ -753,7 +753,7 @@ else {
         else {
             if ($wimInfo.Count -eq 1) {
                 $sourceIndex = $wimInfo[0].Index
-                Write-Host "Only one image index found. Automatically selecting index $sourceIndex: $($wimInfo[0].ImageName)" -ForegroundColor Yellow
+                Write-Host "Only one image index found. Automatically selecting index ${sourceIndex}: $($wimInfo[0].ImageName)" -ForegroundColor Yellow
             } else {
                 $sourceIndex = Read-Host -Prompt "`nEnter the index to mount"
             }
