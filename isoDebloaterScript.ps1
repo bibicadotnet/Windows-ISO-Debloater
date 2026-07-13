@@ -818,7 +818,8 @@ $appxPatternsToRemove = @(
     "Microsoft.SkypeApp*",                      # Skype
     "Microsoft.MicrosoftStickyNotes*",          # Sticky Notes
     "Microsoft.MicrosoftSolitaireCollection*",  # SolitaireCollection
-    # "Microsoft.WindowsSoundRecorder*",          # SoundRecorder
+    "Microsoft.WindowsSoundRecorder*",          # SoundRecorder
+    "Microsoft.ScreenSketch*",                  # Snip & Sketch
     "MicrosoftTeams*",                          # Teams_old
     "MSTeams*",                                 # Teams
     "Microsoft.Windows.Teams*",                 # Teams
@@ -1276,9 +1277,8 @@ if ($DoEDGERemove) {
 }
 
 # Remove AI components
-if ($buildNumber -ge 22000) {
-    if ($DoAIRemove) {
-        Write-Host ("`n[INFO] Removing AI components...") -ForegroundColor Cyan
+if ($DoAIRemove) {
+    Write-Host ("`n[INFO] Removing AI components...") -ForegroundColor Cyan
         Write-Log -msg "Removing AI components"
 
         # Remove AI Packages
@@ -1432,7 +1432,7 @@ if ($buildNumber -ge 22000) {
     } else {
         Write-Log -msg "AI Components removal skipped"
     }
-}
+
 
 # Registry Tweaks
 Write-Host ("`n[INFO] Loading Registry...") -ForegroundColor Cyan
@@ -1491,13 +1491,13 @@ reg add "HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo"
 reg add "HKLM\zSYSTEM\ControlSet001\Services\dmwappushservice" /v "Start" /t REG_DWORD /d "4" /f 2>&1 | Write-Log
 Write-Host "[DONE]" -ForegroundColor Green
 
-# Disable Mouse Acceleration
-Write-Host -NoNewline ("  Disabling Mouse Acceleration".PadRight($statusColumn))
-Write-Log -msg "Disabling Mouse Acceleration"
-reg add "HKLM\zNTUSER\Control Panel\Mouse" /v "MouseSpeed" /t REG_SZ /d "0" /f 2>&1 | Write-Log
-reg add "HKLM\zNTUSER\Control Panel\Mouse" /v "MouseThreshold1" /t REG_SZ /d "0" /f 2>&1 | Write-Log
-reg add "HKLM\zNTUSER\Control Panel\Mouse" /v "MouseThreshold2" /t REG_SZ /d "0" /f 2>&1 | Write-Log
-Write-Host "[DONE]" -ForegroundColor Green
+# Disable Mouse Acceleration (Skipped - kept as default)
+# Write-Host -NoNewline ("  Disabling Mouse Acceleration".PadRight($statusColumn))
+# Write-Log -msg "Disabling Mouse Acceleration"
+# reg add "HKLM\zNTUSER\Control Panel\Mouse" /v "MouseSpeed" /t REG_SZ /d "0" /f 2>&1 | Write-Log
+# reg add "HKLM\zNTUSER\Control Panel\Mouse" /v "MouseThreshold1" /t REG_SZ /d "0" /f 2>&1 | Write-Log
+# reg add "HKLM\zNTUSER\Control Panel\Mouse" /v "MouseThreshold2" /t REG_SZ /d "0" /f 2>&1 | Write-Log
+# Write-Host "[DONE]" -ForegroundColor Green
 
 # Disable Meet Now icon
 Write-Host -NoNewline ("  Disabling Meet".PadRight($statusColumn))
